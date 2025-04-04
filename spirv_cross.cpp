@@ -93,6 +93,97 @@ bool Compiler::variable_storage_is_aliased(const SPIRVariable &v)
 	return !is_restrict && (ssbo || image || counter || buffer_reference);
 }
 
+bool Compiler::block_is_control_dependent(const SPIRBlock &block)
+{
+	for (auto &i : block.ops)
+	{
+		auto ops = stream(i);
+		auto op = static_cast<Op>(i.op);
+
+		switch (op)
+		{
+		case OpFunctionCall:
+		{
+			uint32_t func = ops[2];
+			if (function_is_control_dependent(get<SPIRFunction>(func)))
+				return true;
+			break;
+		}
+
+		// Derivatives
+		case OpDPdx:
+		case OpDPdxCoarse:
+		case OpDPdxFine:
+		case OpDPdy:
+		case OpDPdyCoarse:
+		case OpDPdyFine:
+		case OpFwidth:
+		case OpFwidthCoarse:
+		case OpFwidthFine:
+
+		// Anything implicit LOD
+		case OpImageSampleImplicitLod:
+		case OpImageSampleDrefImplicitLod:
+		case OpImageSampleProjImplicitLod:
+		case OpImageSampleProjDrefImplicitLod:
+		case OpImageSparseSampleImplicitLod:
+		case OpImageSparseSampleDrefImplicitLod:
+		case OpImageSparseSampleProjImplicitLod:
+		case OpImageSparseSampleProjDrefImplicitLod:
+		case OpImageQueryLod:
+		case OpImageDrefGather:
+		case OpImageGather:
+		case OpImageSparseDrefGather:
+		case OpImageSparseGather:
+
+		// Anything subgroups
+		case OpGroupNonUniformElect:
+		case OpGroupNonUniformAll:
+		case OpGroupNonUniformAny:
+		case OpGroupNonUniformAllEqual:
+		case OpGroupNonUniformBroadcast:
+		case OpGroupNonUniformBroadcastFirst:
+		case OpGroupNonUniformBallot:
+		case OpGroupNonUniformInverseBallot:
+		case OpGroupNonUniformBallotBitExtract:
+		case OpGroupNonUniformBallotBitCount:
+		case OpGroupNonUniformBallotFindLSB:
+		case OpGroupNonUniformBallotFindMSB:
+		case OpGroupNonUniformShuffle:
+		case OpGroupNonUniformShuffleXor:
+		case OpGroupNonUniformShuffleUp:
+		case OpGroupNonUniformShuffleDown:
+		case OpGroupNonUniformIAdd:
+		case OpGroupNonUniformFAdd:
+		case OpGroupNonUniformIMul:
+		case OpGroupNonUniformFMul:
+		case OpGroupNonUniformSMin:
+		case OpGroupNonUniformUMin:
+		case OpGroupNonUniformFMin:
+		case OpGroupNonUniformSMax:
+		case OpGroupNonUniformUMax:
+		case OpGroupNonUniformFMax:
+		case OpGroupNonUniformBitwiseAnd:
+		case OpGroupNonUniformBitwiseOr:
+		case OpGroupNonUniformBitwiseXor:
+		case OpGroupNonUniformLogicalAnd:
+		case OpGroupNonUniformLogicalOr:
+		case OpGroupNonUniformLogicalXor:
+		case OpGroupNonUniformQuadBroadcast:
+		case OpGroupNonUniformQuadSwap:
+
+		// Control barriers
+		case OpControlBarrier:
+			return true;
+
+		default:
+			break;
+		}
+	}
+
+	return false;
+}
+
 bool Compiler::block_is_pure(const SPIRBlock &block)
 {
 	// This is a global side effect of the function.
@@ -119,6 +210,7 @@ bool Compiler::block_is_pure(const SPIRBlock &block)
 
 		case OpCopyMemory:
 		case OpStore:
+		case OpCooperativeMatrixStoreKHR:
 		{
 			auto &type = expression_type(ops[0]);
 			if (type.storage != StorageClassFunction)
@@ -247,16 +339,19 @@ string Compiler::to_name(uint32_t id, bool allow_alias) const
 bool Compiler::function_is_pure(const SPIRFunction &func)
 {
 	for (auto block : func.blocks)
-	{
 		if (!block_is_pure(get<SPIRBlock>(block)))
-		{
-			//fprintf(stderr, "Function %s is impure!\n", to_name(func.self).c_str());
 			return false;
-		}
-	}
 
-	//fprintf(stderr, "Function %s is pure!\n", to_name(func.self).c_str());
 	return true;
+}
+
+bool Compiler::function_is_control_dependent(const SPIRFunction &func)
+{
+	for (auto block : func.blocks)
+		if (block_is_control_dependent(get<SPIRBlock>(block)))
+			return true;
+
+	return false;
 }
 
 void Compiler::register_global_read_dependencies(const SPIRBlock &block, uint32_t id)
@@ -276,6 +371,7 @@ void Compiler::register_global_read_dependencies(const SPIRBlock &block, uint32_
 		}
 
 		case OpLoad:
+		case OpCooperativeMatrixLoadKHR:
 		case OpImageRead:
 		{
 			// If we're in a storage class which does not get invalidated, adding dependencies here is no big deal.
@@ -493,6 +589,7 @@ const SPIRType &Compiler::expression_type(uint32_t id) const
 bool Compiler::expression_is_lvalue(uint32_t id) const
 {
 	auto &type = expression_type(id);
+
 	switch (type.basetype)
 	{
 	case SPIRType::SampledImage:
@@ -627,15 +724,29 @@ bool Compiler::is_matrix(const SPIRType &type) const
 
 bool Compiler::is_array(const SPIRType &type) const
 {
-	return !type.array.empty();
+	return type.op == OpTypeArray || type.op == OpTypeRuntimeArray;
+}
+
+bool Compiler::is_pointer(const SPIRType &type) const
+{
+	return type.op == OpTypePointer && type.basetype != SPIRType::Unknown; // Ignore function pointers.
+}
+
+bool Compiler::is_physical_pointer(const SPIRType &type) const
+{
+	return type.op == OpTypePointer && type.storage == StorageClassPhysicalStorageBuffer;
+}
+
+bool Compiler::is_physical_pointer_to_buffer_block(const SPIRType &type) const
+{
+	return is_physical_pointer(type) && get_pointee_type(type).self == type.parent_type &&
+	       (has_decoration(type.self, DecorationBlock) ||
+	        has_decoration(type.self, DecorationBufferBlock));
 }
 
 bool Compiler::is_runtime_size_array(const SPIRType &type)
 {
-	if (type.array.empty())
-		return false;
-	assert(type.array.size() == type.array_size_literal.size());
-	return type.array_size_literal.back() && type.array.back() == 0;
+	return type.op == OpTypeRuntimeArray;
 }
 
 ShaderResources Compiler::get_shader_resources() const
@@ -710,6 +821,7 @@ bool Compiler::InterfaceVariableAccessHandler::handle(Op opcode, const uint32_t 
 
 	case OpAtomicStore:
 	case OpStore:
+	case OpCooperativeMatrixStoreKHR:
 		// Invalid SPIR-V.
 		if (length < 1)
 			return false;
@@ -802,6 +914,7 @@ bool Compiler::InterfaceVariableAccessHandler::handle(Op opcode, const uint32_t 
 	case OpInBoundsAccessChain:
 	case OpPtrAccessChain:
 	case OpLoad:
+	case OpCooperativeMatrixLoadKHR:
 	case OpCopyObject:
 	case OpImageTexelPointer:
 	case OpAtomicLoad:
@@ -1048,20 +1161,25 @@ ShaderResources Compiler::get_shader_resources(const unordered_set<VariableID> *
 	return res;
 }
 
-bool Compiler::type_is_block_like(const SPIRType &type) const
+bool Compiler::type_is_top_level_block(const SPIRType &type) const
 {
 	if (type.basetype != SPIRType::Struct)
 		return false;
+	return has_decoration(type.self, DecorationBlock) || has_decoration(type.self, DecorationBufferBlock);
+}
 
-	if (has_decoration(type.self, DecorationBlock) || has_decoration(type.self, DecorationBufferBlock))
-	{
+bool Compiler::type_is_block_like(const SPIRType &type) const
+{
+	if (type_is_top_level_block(type))
 		return true;
-	}
 
-	// Block-like types may have Offset decorations.
-	for (uint32_t i = 0; i < uint32_t(type.member_types.size()); i++)
-		if (has_member_decoration(type.self, i, DecorationOffset))
-			return true;
+	if (type.basetype == SPIRType::Struct)
+	{
+		// Block-like types may have Offset decorations.
+		for (uint32_t i = 0; i < uint32_t(type.member_types.size()); i++)
+			if (has_member_decoration(type.self, i, DecorationOffset))
+				return true;
+	}
 
 	return false;
 }
@@ -1208,7 +1326,7 @@ const SPIRType &Compiler::get_pointee_type(uint32_t type_id) const
 
 uint32_t Compiler::get_variable_data_type_id(const SPIRVariable &var) const
 {
-	if (var.phi_variable)
+	if (var.phi_variable || var.storage == spv::StorageClass::StorageClassAtomicCounter)
 		return var.basetype;
 	return get_pointee_type_id(var.basetype);
 }
@@ -1735,6 +1853,11 @@ const SmallVector<SPIRBlock::Case> &Compiler::get_case_list(const SPIRBlock &blo
 	if (const auto *constant = maybe_get<SPIRConstant>(block.condition))
 	{
 		const auto &type = get<SPIRType>(constant->constant_type);
+		width = type.width;
+	}
+	else if (const auto *op = maybe_get<SPIRConstantOp>(block.condition))
+	{
+		const auto &type = get<SPIRType>(op->basetype);
 		width = type.width;
 	}
 	else if (const auto *var = maybe_get<SPIRVariable>(block.condition))
@@ -2451,6 +2574,15 @@ void Compiler::add_active_interface_variable(uint32_t var_id)
 
 void Compiler::inherit_expression_dependencies(uint32_t dst, uint32_t source_expression)
 {
+	auto *ptr_e = maybe_get<SPIRExpression>(dst);
+
+	if (is_position_invariant() && ptr_e && maybe_get<SPIRExpression>(source_expression))
+	{
+		auto &deps = ptr_e->invariance_dependencies;
+		if (std::find(deps.begin(), deps.end(), source_expression) == deps.end())
+			deps.push_back(source_expression);
+	}
+
 	// Don't inherit any expression dependencies if the expression in dst
 	// is not a forwarded temporary.
 	if (forwarded_temporaries.find(dst) == end(forwarded_temporaries) ||
@@ -2459,7 +2591,7 @@ void Compiler::inherit_expression_dependencies(uint32_t dst, uint32_t source_exp
 		return;
 	}
 
-	auto &e = get<SPIRExpression>(dst);
+	auto &e = *ptr_e;
 	auto *phi = maybe_get<SPIRVariable>(source_expression);
 	if (phi && phi->phi_variable)
 	{
@@ -2733,8 +2865,8 @@ void Compiler::CombinedImageSamplerHandler::register_combined_image_sampler(SPIR
 		auto ptr_type_id = id + 1;
 		auto combined_id = id + 2;
 		auto &base = compiler.expression_type(image_id);
-		auto &type = compiler.set<SPIRType>(type_id);
-		auto &ptr_type = compiler.set<SPIRType>(ptr_type_id);
+		auto &type = compiler.set<SPIRType>(type_id, OpTypeSampledImage);
+		auto &ptr_type = compiler.set<SPIRType>(ptr_type_id, OpTypePointer);
 
 		type = base;
 		type.self = type_id;
@@ -2993,7 +3125,7 @@ bool Compiler::CombinedImageSamplerHandler::handle(Op opcode, const uint32_t *ar
 		{
 			// Have to invent the sampled image type.
 			sampled_type = compiler.ir.increase_bound_by(1);
-			auto &type = compiler.set<SPIRType>(sampled_type);
+			auto &type = compiler.set<SPIRType>(sampled_type, OpTypeSampledImage);
 			type = compiler.expression_type(args[2]);
 			type.self = sampled_type;
 			type.basetype = SPIRType::SampledImage;
@@ -3012,7 +3144,7 @@ bool Compiler::CombinedImageSamplerHandler::handle(Op opcode, const uint32_t *ar
 
 		// Make a new type, pointer to OpTypeSampledImage, so we can make a variable of this type.
 		// We will probably have this type lying around, but it doesn't hurt to make duplicates for internal purposes.
-		auto &type = compiler.set<SPIRType>(type_id);
+		auto &type = compiler.set<SPIRType>(type_id, OpTypePointer);
 		auto &base = compiler.get<SPIRType>(sampled_type);
 		type = base;
 		type.pointer = true;
@@ -3058,11 +3190,10 @@ VariableID Compiler::build_dummy_sampler_for_combined_images()
 		auto ptr_type_id = offset + 1;
 		auto var_id = offset + 2;
 
-		SPIRType sampler_type;
-		auto &sampler = set<SPIRType>(type_id);
+		auto &sampler = set<SPIRType>(type_id, OpTypeSampler);
 		sampler.basetype = SPIRType::Sampler;
 
-		auto &ptr_sampler = set<SPIRType>(ptr_type_id);
+		auto &ptr_sampler = set<SPIRType>(ptr_type_id, OpTypePointer);
 		ptr_sampler = sampler;
 		ptr_sampler.self = type_id;
 		ptr_sampler.storage = StorageClassUniformConstant;
@@ -3317,13 +3448,11 @@ bool Compiler::AnalyzeVariableScopeAccessHandler::handle_terminator(const SPIRBl
 bool Compiler::AnalyzeVariableScopeAccessHandler::handle(spv::Op op, const uint32_t *args, uint32_t length)
 {
 	// Keep track of the types of temporaries, so we can hoist them out as necessary.
-	uint32_t result_type, result_id;
+	uint32_t result_type = 0, result_id = 0;
 	if (compiler.instruction_to_result_type(result_type, result_id, op, args, length))
 	{
 		// For some opcodes, we will need to override the result id.
 		// If we need to hoist the temporary, the temporary type is the input, not the result.
-		// FIXME: This will likely break with OpCopyObject + hoisting, but we'll have to
-		// solve it if we ever get there ...
 		if (op == OpConvertUToAccelerationStructureKHR)
 		{
 			auto itr = result_id_to_type.find(args[2]);
@@ -3337,6 +3466,7 @@ bool Compiler::AnalyzeVariableScopeAccessHandler::handle(spv::Op op, const uint3
 	switch (op)
 	{
 	case OpStore:
+	case OpCooperativeMatrixStoreKHR:
 	{
 		if (length < 2)
 			return false;
@@ -3432,6 +3562,13 @@ bool Compiler::AnalyzeVariableScopeAccessHandler::handle(spv::Op op, const uint3
 
 	case OpCopyObject:
 	{
+		// OpCopyObject copies the underlying non-pointer type, 
+		// so any temp variable should be declared using the underlying type.
+		// If the type is a pointer, get its base type and overwrite the result type mapping.
+		auto &type = compiler.get<SPIRType>(result_type);
+		if (type.pointer)
+			result_id_to_type[result_id] = type.parent_type;
+
 		if (length < 3)
 			return false;
 
@@ -3450,6 +3587,7 @@ bool Compiler::AnalyzeVariableScopeAccessHandler::handle(spv::Op op, const uint3
 	}
 
 	case OpLoad:
+	case OpCooperativeMatrixLoadKHR:
 	{
 		if (length < 3)
 			return false;
@@ -3669,6 +3807,7 @@ bool Compiler::StaticExpressionAccessHandler::handle(spv::Op op, const uint32_t 
 	switch (op)
 	{
 	case OpStore:
+	case OpCooperativeMatrixStoreKHR:
 		if (length < 2)
 			return false;
 		if (args[0] == variable_id)
@@ -3679,6 +3818,7 @@ bool Compiler::StaticExpressionAccessHandler::handle(spv::Op op, const uint32_t 
 		break;
 
 	case OpLoad:
+	case OpCooperativeMatrixLoadKHR:
 		if (length < 3)
 			return false;
 		if (args[2] == variable_id && static_expression == 0) // Tried to read from variable before it was initialized.
@@ -3713,6 +3853,14 @@ void Compiler::find_function_local_luts(SPIRFunction &entry, const AnalyzeVariab
 		auto &var = get<SPIRVariable>(accessed_var.first);
 		auto &type = expression_type(accessed_var.first);
 
+		// First check if there are writes to the variable. Later, if there are none, we'll
+		// reconsider it as globally accessed LUT.
+		if (!var.is_written_to)
+		{
+			var.is_written_to = handler.complete_write_variables_to_block.count(var.self) != 0 ||
+			                    handler.partial_write_variables_to_block.count(var.self) != 0;
+		}
+
 		// Only consider function local variables here.
 		// If we only have a single function in our CFG, private storage is also fine,
 		// since it behaves like a function local variable.
@@ -3737,8 +3885,7 @@ void Compiler::find_function_local_luts(SPIRFunction &entry, const AnalyzeVariab
 			static_constant_expression = var.initializer;
 
 			// There can be no stores to this variable, we have now proved we have a LUT.
-			if (handler.complete_write_variables_to_block.count(var.self) != 0 ||
-			    handler.partial_write_variables_to_block.count(var.self) != 0)
+			if (var.is_written_to)
 				continue;
 		}
 		else
@@ -4147,6 +4294,7 @@ bool Compiler::may_read_undefined_variable_in_block(const SPIRBlock &block, uint
 		switch (op.op)
 		{
 		case OpStore:
+		case OpCooperativeMatrixStoreKHR:
 		case OpCopyMemory:
 			if (ops[0] == var)
 				return false;
@@ -4185,6 +4333,7 @@ bool Compiler::may_read_undefined_variable_in_block(const SPIRBlock &block, uint
 
 		case OpCopyObject:
 		case OpLoad:
+		case OpCooperativeMatrixLoadKHR:
 			if (ops[2] == var)
 				return true;
 			break;
@@ -4324,6 +4473,7 @@ bool Compiler::ActiveBuiltinHandler::handle(spv::Op opcode, const uint32_t *args
 	switch (opcode)
 	{
 	case OpStore:
+	case OpCooperativeMatrixStoreKHR:
 		if (length < 1)
 			return false;
 
@@ -4340,6 +4490,7 @@ bool Compiler::ActiveBuiltinHandler::handle(spv::Op opcode, const uint32_t *args
 
 	case OpCopyObject:
 	case OpLoad:
+	case OpCooperativeMatrixLoadKHR:
 		if (length < 3)
 			return false;
 
@@ -4405,11 +4556,9 @@ bool Compiler::ActiveBuiltinHandler::handle(spv::Op opcode, const uint32_t *args
 		for (uint32_t i = 0; i < count; i++)
 		{
 			// Pointers
+			// PtrAccessChain functions more like a pointer offset. Type remains the same.
 			if (opcode == OpPtrAccessChain && i == 0)
-			{
-				type = &compiler.get<SPIRType>(type->parent_type);
 				continue;
-			}
 
 			// Arrays
 			if (!type->array.empty())
@@ -4597,6 +4746,29 @@ void Compiler::build_function_control_flow_graphs_and_analyze()
 			}
 		}
 	}
+
+	// Find LUTs which are not function local. Only consider this case if the CFG is multi-function,
+	// otherwise we treat Private as Function trivially.
+	// Needs to be analyzed from the outside since we have to block the LUT optimization if at least
+	// one function writes to it.
+	if (!single_function)
+	{
+		for (auto &id : global_variables)
+		{
+			auto &var = get<SPIRVariable>(id);
+			auto &type = get_variable_data_type(var);
+
+			if (is_array(type) && var.storage == StorageClassPrivate &&
+			    var.initializer && !var.is_written_to &&
+			    ir.ids[var.initializer].get_type() == TypeConstant)
+			{
+				get<SPIRConstant>(var.initializer).is_used_as_lut = true;
+				var.static_expression = var.initializer;
+				var.statically_assigned = true;
+				var.remapped_variable = true;
+			}
+		}
+	}
 }
 
 Compiler::CFGBuilder::CFGBuilder(Compiler &compiler_)
@@ -4751,13 +4923,16 @@ void Compiler::make_constant_null(uint32_t id, uint32_t type)
 		uint32_t parent_id = ir.increase_bound_by(1);
 		make_constant_null(parent_id, constant_type.parent_type);
 
-		if (!constant_type.array_size_literal.back())
-			SPIRV_CROSS_THROW("Array size of OpConstantNull must be a literal.");
-
-		SmallVector<uint32_t> elements(constant_type.array.back());
-		for (uint32_t i = 0; i < constant_type.array.back(); i++)
+		// The array size of OpConstantNull can be either literal or specialization constant.
+		// In the latter case, we cannot take the value as-is, as it can be changed to anything.
+		// Rather, we assume it to be *one* for the sake of initializer.
+		bool is_literal_array_size = constant_type.array_size_literal.back();
+		uint32_t count = is_literal_array_size ? constant_type.array.back() : 1;
+		SmallVector<uint32_t> elements(count);
+		for (uint32_t i = 0; i < count; i++)
 			elements[i] = parent_id;
-		set<SPIRConstant>(id, type, elements.data(), uint32_t(elements.size()), false);
+		auto &constant = set<SPIRConstant>(id, type, elements.data(), uint32_t(elements.size()), false);
+		constant.is_null_array_specialized_length = !is_literal_array_size;
 	}
 	else if (!constant_type.member_types.empty())
 	{
@@ -5013,8 +5188,7 @@ void Compiler::PhysicalStorageBufferPointerHandler::mark_aligned_access(uint32_t
 bool Compiler::PhysicalStorageBufferPointerHandler::type_is_bda_block_entry(uint32_t type_id) const
 {
 	auto &type = compiler.get<SPIRType>(type_id);
-	return type.storage == StorageClassPhysicalStorageBufferEXT && type.pointer &&
-	       type.pointer_depth == 1 && !compiler.type_is_array_of_pointers(type);
+	return compiler.is_physical_pointer(type);
 }
 
 uint32_t Compiler::PhysicalStorageBufferPointerHandler::get_minimum_scalar_alignment(const SPIRType &type) const
@@ -5044,7 +5218,8 @@ void Compiler::PhysicalStorageBufferPointerHandler::setup_meta_chain(uint32_t ty
 		access_chain_to_physical_block[var_id] = &meta;
 
 		auto &type = compiler.get<SPIRType>(type_id);
-		if (type.basetype != SPIRType::Struct)
+
+		if (!compiler.is_physical_pointer_to_buffer_block(type))
 			non_block_types.insert(type_id);
 
 		if (meta.alignment == 0)
@@ -5093,6 +5268,13 @@ bool Compiler::PhysicalStorageBufferPointerHandler::handle(Op op, const uint32_t
 		break;
 	}
 
+	case OpCooperativeMatrixLoadKHR:
+	case OpCooperativeMatrixStoreKHR:
+	{
+		// TODO: Can we meaningfully deal with this?
+		break;
+	}
+
 	default:
 		break;
 	}
@@ -5103,9 +5285,7 @@ bool Compiler::PhysicalStorageBufferPointerHandler::handle(Op op, const uint32_t
 uint32_t Compiler::PhysicalStorageBufferPointerHandler::get_base_non_block_type_id(uint32_t type_id) const
 {
 	auto *type = &compiler.get<SPIRType>(type_id);
-	while (type->pointer &&
-	       type->storage == StorageClassPhysicalStorageBufferEXT &&
-	       !type_is_bda_block_entry(type_id))
+	while (compiler.is_physical_pointer(*type) && !type_is_bda_block_entry(type_id))
 	{
 		type_id = type->parent_type;
 		type = &compiler.get<SPIRType>(type_id);
@@ -5120,12 +5300,10 @@ void Compiler::PhysicalStorageBufferPointerHandler::analyze_non_block_types_from
 	for (auto &member : type.member_types)
 	{
 		auto &subtype = compiler.get<SPIRType>(member);
-		if (subtype.basetype != SPIRType::Struct && subtype.pointer &&
-		    subtype.storage == spv::StorageClassPhysicalStorageBufferEXT)
-		{
+
+		if (compiler.is_physical_pointer(subtype) && !compiler.is_physical_pointer_to_buffer_block(subtype))
 			non_block_types.insert(get_base_non_block_type_id(member));
-		}
-		else if (subtype.basetype == SPIRType::Struct && !subtype.pointer)
+		else if (subtype.basetype == SPIRType::Struct && !compiler.is_pointer(subtype))
 			analyze_non_block_types_from_block(subtype);
 	}
 }
@@ -5138,9 +5316,14 @@ void Compiler::analyze_non_block_pointer_types()
 	// Analyze any block declaration we have to make. It might contain
 	// physical pointers to POD types which we never used, and thus never added to the list.
 	// We'll need to add those pointer types to the set of types we declare.
-	ir.for_each_typed_id<SPIRType>([&](uint32_t, SPIRType &type) {
-		if (has_decoration(type.self, DecorationBlock) || has_decoration(type.self, DecorationBufferBlock))
+	ir.for_each_typed_id<SPIRType>([&](uint32_t id, SPIRType &type) {
+		// Only analyze the raw block struct, not any pointer-to-struct, since that's just redundant.
+		if (type.self == id &&
+		    (has_decoration(type.self, DecorationBlock) ||
+		     has_decoration(type.self, DecorationBufferBlock)))
+		{
 			handler.analyze_non_block_types_from_block(type);
+		}
 	});
 
 	physical_storage_non_block_pointer_types.reserve(handler.non_block_types.size());
@@ -5247,6 +5430,7 @@ bool Compiler::InterlockedResourceAccessHandler::handle(Op opcode, const uint32_
 	switch (opcode)
 	{
 	case OpLoad:
+	case OpCooperativeMatrixLoadKHR:
 	{
 		if (length < 3)
 			return false;
@@ -5324,6 +5508,7 @@ bool Compiler::InterlockedResourceAccessHandler::handle(Op opcode, const uint32_
 	case OpStore:
 	case OpImageWrite:
 	case OpAtomicStore:
+	case OpCooperativeMatrixStoreKHR:
 	{
 		if (length < 1)
 			return false;
@@ -5460,9 +5645,39 @@ void Compiler::analyze_interlocked_resource_usage()
 	}
 }
 
+// Helper function
+bool Compiler::check_internal_recursion(const SPIRType &type, std::unordered_set<uint32_t> &checked_ids)
+{
+	if (type.basetype != SPIRType::Struct)
+		return false;
+
+	if (checked_ids.count(type.self))
+		return true;
+
+	// Recurse into struct members
+	bool is_recursive = false;
+	checked_ids.insert(type.self);
+	uint32_t mbr_cnt = uint32_t(type.member_types.size());
+	for (uint32_t mbr_idx = 0; !is_recursive && mbr_idx < mbr_cnt; mbr_idx++)
+	{
+		uint32_t mbr_type_id = type.member_types[mbr_idx];
+		auto &mbr_type = get<SPIRType>(mbr_type_id);
+		is_recursive |= check_internal_recursion(mbr_type, checked_ids);
+	}
+	checked_ids.erase(type.self);
+	return is_recursive;
+}
+
+// Return whether the struct type contains a structural recursion nested somewhere within its content.
+bool Compiler::type_contains_recursion(const SPIRType &type)
+{
+	std::unordered_set<uint32_t> checked_ids;
+	return check_internal_recursion(type, checked_ids);
+}
+
 bool Compiler::type_is_array_of_pointers(const SPIRType &type) const
 {
-	if (!type_is_top_level_array(type))
+	if (!is_array(type))
 		return false;
 
 	// BDA types must have parent type hierarchy.
@@ -5471,45 +5686,10 @@ bool Compiler::type_is_array_of_pointers(const SPIRType &type) const
 
 	// Punch through all array layers.
 	auto *parent = &get<SPIRType>(type.parent_type);
-	while (type_is_top_level_array(*parent))
+	while (is_array(*parent))
 		parent = &get<SPIRType>(parent->parent_type);
 
-	return type_is_top_level_pointer(*parent);
-}
-
-bool Compiler::type_is_top_level_pointer(const SPIRType &type) const
-{
-	if (!type.pointer)
-		return false;
-
-	// Function pointers, should not be hit by valid SPIR-V.
-	// Parent type will be SPIRFunction instead.
-	if (type.basetype == SPIRType::Unknown)
-		return false;
-
-	// Some types are synthesized in-place without complete type hierarchy and might not have parent types,
-	// but these types are never array-of-pointer or any complicated BDA type, infer reasonable defaults.
-	if (type.parent_type)
-		return type.pointer_depth > get<SPIRType>(type.parent_type).pointer_depth;
-	else
-		return true;
-}
-
-bool Compiler::type_is_top_level_physical_pointer(const SPIRType &type) const
-{
-	return type_is_top_level_pointer(type) && type.storage == StorageClassPhysicalStorageBuffer;
-}
-
-bool Compiler::type_is_top_level_array(const SPIRType &type) const
-{
-	if (type.array.empty())
-		return false;
-
-	// If we have pointer and array, we infer pointer-to-array as it's the only meaningful thing outside BDA.
-	if (type.parent_type)
-		return type.array.size() > get<SPIRType>(type.parent_type).array.size();
-	else
-		return !type.pointer;
+	return is_pointer(*parent);
 }
 
 bool Compiler::flush_phi_required(BlockID from, BlockID to) const
